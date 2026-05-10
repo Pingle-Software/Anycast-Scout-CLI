@@ -1,0 +1,343 @@
+name: Backend Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.5. Defaults to Cargo.toml version."
+        required: false
+        type: string
+      dispatch_gui:
+        description: "Trigger the GUI release workflow after the backend release is verified."
+        required: true
+        default: true
+        type: boolean
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: backend-release-${{ github.ref }}-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.95"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      release_version: ${{ steps.meta.outputs.release_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: meta
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ -z "$cargo_version" ]; then
+            echo "Failed to read package version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+            release_tag="${GITHUB_REF_NAME}"
+          elif [ -n "$INPUT_TAG" ]; then
+            release_tag="$INPUT_TAG"
+          else
+            release_tag="v${cargo_version}"
+          fi
+
+          if ! [[ "$release_tag" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+            echo "Release tag must match vMAJOR.MINOR.PATCH: $release_tag" >&2
+            exit 1
+          fi
+
+          release_version="${release_tag#v}"
+          {
+            echo "release_tag=${release_tag}"
+            echo "release_version=${release_version}"
+          } >>"$GITHUB_OUTPUT"
+
+          printf 'Prepared backend release %s (%s)\n' "$release_tag" "$release_version"
+
+  verify:
+    name: Verify Rust
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs:
+      - prepare
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: rust-release-verify-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rust-release-verify-${{ runner.os }}-
+
+      - name: Install Rust components
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustup component add rustfmt clippy
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs:
+      - prepare
+      - verify
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: anycast-scout
+            archive: anycast-scout-linux-amd64.tar.gz
+          - platform: windows-amd64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: anycast-scout.exe
+            archive: anycast-scout-windows-amd64.tar.gz
+          - platform: macos-amd64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            binary: anycast-scout
+            archive: anycast-scout-macos-amd64.tar.gz
+          - platform: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            binary: anycast-scout
+            archive: anycast-scout-macos-arm64.tar.gz
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: rust-release-build-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            rust-release-build-${{ runner.os }}-${{ matrix.target }}-
+
+      - name: Install target
+        shell: bash
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add "${{ matrix.target }}"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          ANYCAST_SCOUT_VERSION="${{ needs.prepare.outputs.release_version }}" \
+            cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "dist/package/${{ matrix.binary }}"
+          chmod 755 "dist/package/${{ matrix.binary }}"
+          tar -C dist/package -czf "dist/${{ matrix.archive }}" "${{ matrix.binary }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${{ matrix.archive }}" >"${{ matrix.archive }}.sha256")
+          else
+            (cd dist && shasum -a 256 "${{ matrix.archive }}" >"${{ matrix.archive }}.sha256")
+          fi
+          tar -tzf "dist/${{ matrix.archive }}" | grep -Fx "${{ matrix.binary }}"
+
+      - name: Smoke backend binary
+        if: matrix.platform == 'linux-amd64'
+        shell: bash
+        run: "dist/package/${{ matrix.binary }} --version"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-${{ matrix.platform }}
+          path: |
+            dist/${{ matrix.archive }}
+            dist/${{ matrix.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - prepare
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      release_url: ${{ steps.release.outputs.release_url }}
+
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          pattern: backend-*
+          merge-multiple: true
+
+      - name: Verify artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          for checksum in *.sha256; do
+            sha256sum -c "$checksum"
+          done
+          for archive in *.tar.gz; do
+            case "$archive" in
+              *windows*) expected="anycast-scout.exe" ;;
+              *) expected="anycast-scout" ;;
+            esac
+            tar -tzf "$archive" | grep -Fx "$expected"
+          done
+
+      - name: Create or update release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.release_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="Automated backend release for ${GITHUB_SHA}.
+
+          Native CLI archives are built and checksum-verified for Linux, macOS, and Windows."
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "anycast-scout ${RELEASE_TAG}" \
+              --notes "$notes"
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "anycast-scout ${RELEASE_TAG}" \
+              --notes "$notes"
+          fi
+
+          release_url="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
+          echo "release_url=${release_url}" >>"$GITHUB_OUTPUT"
+
+  verify-release:
+    name: Verify published release
+    needs:
+      - prepare
+      - publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p release-download
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-download \
+            --pattern "anycast-scout-*"
+
+      - name: Verify downloaded assets
+        run: |
+          set -euo pipefail
+          cd release-download
+          for checksum in *.sha256; do
+            sha256sum -c "$checksum"
+          done
+          for archive in *.tar.gz; do
+            case "$archive" in
+              *windows*) expected="anycast-scout.exe" ;;
+              *) expected="anycast-scout" ;;
+            esac
+            tar -tzf "$archive" | grep -Fx "$expected"
+          done
+
+  dispatch-gui:
+    name: Trigger GUI release
+    needs:
+      - prepare
+      - publish
+      - verify-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ github.event_name == 'push' || inputs.dispatch_gui }}
+    env:
+      GUI_RELEASE_DISPATCH_TOKEN: ${{ secrets.GUI_RELEASE_DISPATCH_TOKEN }}
+
+    steps:
+      - name: Dispatch GUI repository
+        if: env.GUI_RELEASE_DISPATCH_TOKEN != ''
+        env:
+          GH_TOKEN: ${{ env.GUI_RELEASE_DISPATCH_TOKEN }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          RELEASE_URL: ${{ needs.publish.outputs.release_url }}
+        run: |
+          set -euo pipefail
+          gh api \
+            --method POST \
+            repos/Pingle-Software/Anycast-Scout-GUI/dispatches \
+            -f event_type=backend-released \
+            -f client_payload[backend_tag]="$RELEASE_TAG" \
+            -f client_payload[backend_sha]="$GITHUB_SHA" \
+            -f client_payload[backend_release_url]="$RELEASE_URL"
+
+      - name: Explain skipped GUI dispatch
+        if: env.GUI_RELEASE_DISPATCH_TOKEN == ''
+        run: |
+          echo "GUI_RELEASE_DISPATCH_TOKEN is not configured; backend release was published but GUI dispatch was skipped."
