@@ -251,9 +251,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          notes="Automated backend release for ${GITHUB_SHA}.
+          notes="$(cat <<EOF
+          > [!WARNING]
+          > **In Development / Alpha.** Anycast Scout CLI is under active development. Command-line options, output formats, and release artifacts may change before a stable release.
 
-          Native CLI archives are built and checksum-verified for Linux, macOS, and Windows."
+          Automated backend release for ${GITHUB_SHA}.
+
+          Native CLI archives are built and checksum-verified for Linux, macOS, and Windows.
+          EOF
+          )"
 
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber

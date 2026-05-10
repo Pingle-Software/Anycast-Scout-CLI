@@ -1,5 +1,11 @@
 # Anycast Scout CLI
 
+> [!WARNING]
+> **In Development / Alpha.** Anycast Scout CLI is under active development.
+> Command-line options, output formats, and release artifacts may change before
+> a stable release. Review generated targets and configs before using them in
+> production workflows.
+
 Rust CLI for discovering, probing, and ranking anycast edge IP candidates. It
 is the backend used by the Anycast Scout desktop GUI and can also run as a
 standalone command-line tool.
