@@ -1,0 +1,27 @@
+[package]
+name = "anycast-scout"
+version = "0.1.5"
+edition = "2024"
+authors = ["Pingle Software"]
+description = "Cloudflare edge IP validator with optional host-routed probing and speed checks."
+license = "MIT"
+repository = "https://gitlab.com/pingle_software/tools/anycast-scout/backend"
+rust-version = "1.95"
+
+[dependencies]
+anyhow = "1.0.102"
+clap = { version = "4.6.1", features = ["derive"] }
+csv = "1.4.0"
+flate2 = "1.1.9"
+futures = "0.3.32"
+ipnet = "2.12.0"
+reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
+rustls = { version = "0.23.39", default-features = false, features = ["ring"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.11.0"
+tar = "0.4.45"
+tempfile = "3.27.0"
+thiserror = "2.0.18"
+tokio = { version = "1.52.1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+url = "2.5.8"

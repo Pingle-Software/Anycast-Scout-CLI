@@ -1,0 +1,32 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: anycast-scout-backend
+  title: Anycast Scout Backend
+  description: >
+    Rust backend and CLI for Anycast Scout edge discovery, target expansion,
+    validation, speed checks, and sing-box URL tests.
+  annotations:
+    gitlab.com/project-slug: pingle_software/tools/anycast-scout/backend
+    backstage.io/techdocs-ref: dir:.
+    backstage.io/source-location: url:https://gitlab.com/pingle_software/tools/anycast-scout/backend/-/tree/main
+  tags:
+    - rust
+    - cli
+    - anycast
+    - cloudflare
+    - sing-box
+    - network-tools
+  links:
+    - url: https://gitlab.com/pingle_software/tools/anycast-scout/backend
+      title: GitLab Repository
+      icon: gitlab
+    - url: https://gitlab.com/pingle_software/tools/anycast-scout/gui
+      title: Anycast Scout GUI
+      icon: gitlab
+spec:
+  type: service
+  lifecycle: production
+  owner: group:pingle-software
+  system: anycast-scout
+  providesApis: []

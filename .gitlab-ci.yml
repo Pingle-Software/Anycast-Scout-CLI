@@ -1,0 +1,341 @@
+stages:
+  - test
+  - prepare
+  - build
+  - publish
+  - release
+  - verify
+  - downstream
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TARGET_DIR: "$CI_PROJECT_DIR/.cargo-target"
+  CARGO_INCREMENTAL: "0"
+  CARGO_TERM_COLOR: "always"
+  RUST_IMAGE: "rust:1.95-bookworm"
+  CARGO_ZIGBUILD_IMAGE: "ghcr.io/rust-cross/cargo-zigbuild:0.22.3"
+  PACKAGE_NAME: "anycast-scout-backend"
+
+.rust-cache:
+  cache:
+    key:
+      files:
+        - Cargo.lock
+      prefix: rust-1.95
+    paths:
+      - .cargo/registry/index/
+      - .cargo/registry/cache/
+      - .cargo/git/db/
+      - .cargo-target/
+    policy: pull-push
+
+.rust-linux:
+  image: $RUST_IMAGE
+  extends: .rust-cache
+  tags:
+    - hetzner
+  before_script:
+    - rustc --version
+    - cargo --version
+
+.rust-verify:
+  extends: .rust-linux
+  before_script:
+    - rustc --version
+    - cargo --version
+    - rustup component add rustfmt clippy
+
+.release-ci-rules: &release_ci_rules
+  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+  - if: '$CI_COMMIT_BRANCH == "main"'
+  - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+.main-release-rules: &main_release_rules
+  - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH && $CI_PIPELINE_SOURCE == "push"'
+
+verify:rust:
+  extends: .rust-verify
+  stage: test
+  interruptible: true
+  rules: *release_ci_rules
+  script:
+    - cargo fmt --check
+    - cargo clippy --all-targets --locked -- -D warnings
+    - cargo test --locked
+
+release:prepare:
+  extends: .rust-linux
+  stage: prepare
+  interruptible: true
+  rules: *release_ci_rules
+  needs:
+    - verify:rust
+  script:
+    - git fetch --tags --quiet
+    - |
+      cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+      if [ -z "$cargo_version" ]; then
+        echo "failed to read package version from Cargo.toml" >&2
+        exit 1
+      fi
+
+      commit_branch="${CI_COMMIT_BRANCH:-${CI_MERGE_REQUEST_SOURCE_BRANCH_NAME:-}}"
+      if [ "$commit_branch" = "$CI_DEFAULT_BRANCH" ] && [ "$CI_PIPELINE_SOURCE" = "push" ]; then
+        base_tag="v${cargo_version}"
+        if git rev-parse -q --verify "refs/tags/${base_tag}" >/dev/null; then
+          latest_tag="$(git tag -l | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true)"
+          if [ -z "$latest_tag" ]; then
+            echo "base tag ${base_tag} exists but no semver tags were found" >&2
+            exit 1
+          fi
+          version="${latest_tag#v}"
+          major="${version%%.*}"
+          rest="${version#*.}"
+          minor="${rest%%.*}"
+          patch="${rest#*.}"
+          release_tag="v${major}.${minor}.$((patch + 1))"
+        else
+          release_tag="${base_tag}"
+        fi
+
+        release_version="${release_tag#v}"
+      else
+        release_tag="ci-${CI_COMMIT_REF_SLUG}-${CI_PIPELINE_IID}"
+        release_version="${cargo_version}+ci.${CI_PIPELINE_IID}"
+      fi
+
+      {
+        echo "RELEASE_TAG=${release_tag}"
+        echo "RELEASE_VERSION=${release_version}"
+      } | tee release.env
+      echo "Prepared ${release_tag} (${release_version}) for ${CI_COMMIT_SHA} on ${commit_branch:-${CI_COMMIT_REF_NAME}}"
+  artifacts:
+    reports:
+      dotenv: release.env
+    paths:
+      - release.env
+    expire_in: 30 days
+
+.package-template:
+  stage: build
+  interruptible: true
+  rules: *release_ci_rules
+  needs:
+    - job: release:prepare
+      artifacts: true
+  artifacts:
+    name: "$CI_JOB_NAME-$CI_COMMIT_REF_SLUG"
+    paths:
+      - dist/
+    expire_in: 30 days
+
+release:linux-amd64:
+  extends:
+    - .rust-linux
+    - .package-template
+  script:
+    - rm -rf "$CARGO_TARGET_DIR/release/build"
+    - ANYCAST_SCOUT_VERSION="$RELEASE_VERSION" cargo build --release --locked
+    - archive_name="anycast-scout-linux-amd64.tar.gz"
+    - mkdir -p dist/package
+    - install -m 755 "$CARGO_TARGET_DIR/release/anycast-scout" dist/package/anycast-scout
+    - tar -C dist/package -czf "dist/${archive_name}" anycast-scout
+    - (cd dist && sha256sum "${archive_name}" > "${archive_name}.sha256")
+    - tar -tzf "dist/${archive_name}" | grep -Fx anycast-scout
+    - "dist/package/anycast-scout --version"
+
+release:windows-amd64:
+  extends:
+    - .rust-linux
+    - .package-template
+  variables:
+    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
+  before_script:
+    - rustc --version
+    - cargo --version
+    - apt-get update
+    - apt-get install -y --no-install-recommends ca-certificates gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+    - rustup target add x86_64-pc-windows-gnu
+  script:
+    - rm -rf "$CARGO_TARGET_DIR/release/build"
+    - ANYCAST_SCOUT_VERSION="$RELEASE_VERSION" cargo build --release --locked --target x86_64-pc-windows-gnu
+    - archive_name="anycast-scout-windows-amd64.tar.gz"
+    - mkdir -p dist/package
+    - cp "$CARGO_TARGET_DIR/x86_64-pc-windows-gnu/release/anycast-scout.exe" dist/package/anycast-scout.exe
+    - tar -C dist/package -czf "dist/${archive_name}" anycast-scout.exe
+    - (cd dist && sha256sum "${archive_name}" > "${archive_name}.sha256")
+    - tar -tzf "dist/${archive_name}" | grep -Fx anycast-scout.exe
+
+release:macos:
+  extends:
+    - .rust-cache
+    - .package-template
+  image: $CARGO_ZIGBUILD_IMAGE
+  tags:
+    - hetzner
+  before_script:
+    - rustup toolchain install 1.95 --profile minimal --no-self-update
+    - rustup target add --toolchain 1.95 x86_64-apple-darwin aarch64-apple-darwin
+    - rustc +1.95 --version
+    - cargo +1.95 --version
+    - cargo-zigbuild --version
+  script:
+    - |
+      build_macos_archive() {
+        target="$1"
+        platform="$2"
+        archive_name="anycast-scout-${platform}.tar.gz"
+        ANYCAST_SCOUT_VERSION="$RELEASE_VERSION" cargo +1.95 zigbuild --release --locked --target "$target"
+        rm -rf dist/package
+        mkdir -p dist/package
+        install -m 755 "$CARGO_TARGET_DIR/$target/release/anycast-scout" dist/package/anycast-scout
+        tar -C dist/package -czf "dist/${archive_name}" anycast-scout
+        (cd dist && sha256sum "${archive_name}" > "${archive_name}.sha256")
+        tar -tzf "dist/${archive_name}" | grep -Fx anycast-scout
+      }
+
+      mkdir -p dist
+      rm -rf "$CARGO_TARGET_DIR/release/build"
+      build_macos_archive x86_64-apple-darwin macos-amd64
+      build_macos_archive aarch64-apple-darwin macos-arm64
+
+publish:release-assets:
+  stage: publish
+  image: alpine:3.22
+  tags:
+    - hetzner
+  rules: *main_release_rules
+  needs:
+    - job: release:prepare
+      artifacts: true
+    - job: release:linux-amd64
+      artifacts: true
+    - job: release:windows-amd64
+      artifacts: true
+    - job: release:macos
+      artifacts: true
+  before_script:
+    - apk add --no-cache curl
+  script:
+    - package_base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${RELEASE_VERSION}"
+    - |
+      for file in dist/*; do
+        test -f "$file" || continue
+        filename="$(basename "$file")"
+        curl --fail --location --silent --show-error \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --upload-file "$file" \
+          "${package_base}/${filename}"
+      done
+  artifacts:
+    when: always
+    paths:
+      - dist/
+    expire_in: 30 days
+
+release:gitlab:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  tags:
+    - hetzner
+  resource_group: release
+  rules: *main_release_rules
+  needs:
+    - job: release:prepare
+      artifacts: true
+    - job: publish:release-assets
+      artifacts: false
+  script:
+    - echo "Creating GitLab release ${RELEASE_TAG}"
+  release:
+    tag_name: "$RELEASE_TAG"
+    ref: "$CI_COMMIT_SHA"
+    name: "anycast-scout $RELEASE_TAG"
+    description: "Automated backend release for ${CI_COMMIT_SHORT_SHA} from ${CI_COMMIT_BRANCH}. Includes native CLI binaries for Linux, macOS, and Windows."
+    assets:
+      links:
+        - name: "anycast-scout-linux-amd64.tar.gz"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${RELEASE_VERSION}/anycast-scout-linux-amd64.tar.gz"
+          filepath: "/anycast-scout-linux-amd64.tar.gz"
+          link_type: "package"
+        - name: "anycast-scout-linux-amd64.tar.gz.sha256"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${RELEASE_VERSION}/anycast-scout-linux-amd64.tar.gz.sha256"
+          filepath: "/anycast-scout-linux-amd64.tar.gz.sha256"
+          link_type: "package"
+        - name: "anycast-scout-macos-amd64.tar.gz"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${RELEASE_VERSION}/anycast-scout-macos-amd64.tar.gz"
+          filepath: "/anycast-scout-macos-amd64.tar.gz"
+          link_type: "package"
+        - name: "anycast-scout-macos-amd64.tar.gz.sha256"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${RELEASE_VERSION}/anycast-scout-macos-amd64.tar.gz.sha256"
+          filepath: "/anycast-scout-macos-amd64.tar.gz.sha256"
+          link_type: "package"
+        - name: "anycast-scout-macos-arm64.tar.gz"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${RELEASE_VERSION}/anycast-scout-macos-arm64.tar.gz"
+          filepath: "/anycast-scout-macos-arm64.tar.gz"
+          link_type: "package"
+        - name: "anycast-scout-macos-arm64.tar.gz.sha256"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${RELEASE_VERSION}/anycast-scout-macos-arm64.tar.gz.sha256"
+          filepath: "/anycast-scout-macos-arm64.tar.gz.sha256"
+          link_type: "package"
+        - name: "anycast-scout-windows-amd64.tar.gz"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${RELEASE_VERSION}/anycast-scout-windows-amd64.tar.gz"
+          filepath: "/anycast-scout-windows-amd64.tar.gz"
+          link_type: "package"
+        - name: "anycast-scout-windows-amd64.tar.gz.sha256"
+          url: "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${RELEASE_VERSION}/anycast-scout-windows-amd64.tar.gz.sha256"
+          filepath: "/anycast-scout-windows-amd64.tar.gz.sha256"
+          link_type: "package"
+
+verify:release-assets:
+  stage: verify
+  image: alpine:3.22
+  tags:
+    - hetzner
+  rules: *main_release_rules
+  needs:
+    - job: release:prepare
+      artifacts: true
+    - job: release:gitlab
+      artifacts: false
+  before_script:
+    - apk add --no-cache curl tar
+  script:
+    - package_base="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/${PACKAGE_NAME}/${RELEASE_VERSION}"
+    - mkdir -p release-download
+    - |
+      for archive_name in \
+        anycast-scout-linux-amd64.tar.gz \
+        anycast-scout-macos-amd64.tar.gz \
+        anycast-scout-macos-arm64.tar.gz \
+        anycast-scout-windows-amd64.tar.gz
+      do
+        curl --fail --location --silent --show-error \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --output "release-download/${archive_name}" \
+          "${package_base}/${archive_name}"
+        curl --fail --location --silent --show-error \
+          --header "JOB-TOKEN: ${CI_JOB_TOKEN}" \
+          --output "release-download/${archive_name}.sha256" \
+          "${package_base}/${archive_name}.sha256"
+        (cd release-download && sha256sum -c "${archive_name}.sha256")
+        if [ "$archive_name" = "anycast-scout-windows-amd64.tar.gz" ]; then
+          tar -tzf "release-download/${archive_name}" | grep -Fx anycast-scout.exe
+        else
+          tar -tzf "release-download/${archive_name}" | grep -Fx anycast-scout
+        fi
+      done
+
+release:gui:
+  stage: downstream
+  rules: *main_release_rules
+  needs:
+    - job: verify:release-assets
+      artifacts: false
+  trigger:
+    project: pingle_software/tools/anycast-scout/gui
+    branch: main
+    strategy: depend
+  variables:
+    ANYCAST_SCOUT_BACKEND_REF: "$CI_COMMIT_SHA"
+    ANYCAST_SCOUT_BACKEND_PIPELINE_URL: "$CI_PIPELINE_URL"
