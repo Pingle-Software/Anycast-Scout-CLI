@@ -1,7 +1,7 @@
-# Anycast Scout CLI
+# Anycast Scout Core / CLI
 
 > [!WARNING]
-> **In Development / Alpha.** Anycast Scout CLI is under active development.
+> **In Development / Alpha.** Anycast Scout is under active development.
 > Command-line options, output formats, and release artifacts may change before
 > a stable release. Review generated targets and configs before using them in
 > production workflows.
